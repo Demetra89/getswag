@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	fyne.io/fyne/v2 v2.6.1
 	go.etcd.io/bbolt v1.4.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
 require (

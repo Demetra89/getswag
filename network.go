@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,40 +20,72 @@ const (
 	discoveryPingDelay = 5 * time.Second // Период отправки discovery ping
 )
 
+var (
+	isScanning int32 // Флаг для отслеживания процесса сканирования
+	// Последние успешно найденные адреса пиров
+	lastKnownPeers      = make(map[string]time.Time)
+	lastKnownPeersMutex sync.RWMutex
+)
+
 // startDiscoveryTCPServer запускает TCP сервер для обнаружения пиров
 func startDiscoveryTCPServer(peers chan<- Peer) {
 	log.Println("Запуск TCP сервера обнаружения пиров")
 
-	// Слушаем на всех интерфейсах
-	addr := net.JoinHostPort("", fmt.Sprintf("%d", discoveryPort))
-	listener, err := net.Listen("tcp", addr)
+	// Попытаемся использовать несколько портов, если основной занят
+	var err error
+	maxRetries := 3
+	portOffset := 0
+	var currentPort int
+
+	for i := 0; i < maxRetries; i++ {
+		currentPort = discoveryPort + portOffset
+		currentAddr := net.JoinHostPort("", fmt.Sprintf("%d", currentPort))
+
+		// Защита от одновременного доступа
+		networkMutex.Lock()
+		discoveryListener, err = net.Listen("tcp", currentAddr)
+		networkMutex.Unlock()
+
+		if err == nil {
+			// Порт успешно занят
+			log.Printf("TCP сервер обнаружения успешно запущен на порту %d", currentPort)
+			fmt.Printf("\nTCP сервер обнаружения запущен на порту %d\n", currentPort)
+
+			break
+		}
+
+		log.Printf("Не удалось запустить TCP сервер обнаружения на порту %d: %v, попытка %d",
+			currentPort, err, i+1)
+		portOffset++
+	}
+
 	if err != nil {
-		log.Printf("Ошибка запуска TCP сервера обнаружения: %v", err)
+		log.Printf("Ошибка запуска TCP сервера обнаружения после %d попыток: %v", maxRetries, err)
 		fmt.Printf("\nОшибка запуска TCP сервера обнаружения: %v\n", err)
 		if peers != nil {
 			close(peers)
 		}
 		return
 	}
-	defer listener.Close()
-
-	log.Printf("TCP сервер обнаружения запущен на порту %d", discoveryPort)
-	fmt.Printf("\nTCP сервер обнаружения запущен на порту %d\n", discoveryPort)
 
 	// Запускаем сервис периодического оповещения
 	go announcePeers()
 
-	for running {
-		conn, err := listener.Accept()
-		if err != nil {
-			if !running {
-				break
+	// Обрабатываем входящие соединения в отдельной горутине
+	go func() {
+		for running {
+			// Используем глобальную переменную вместо локальной
+			conn, err := discoveryListener.Accept()
+			if err != nil {
+				if !running {
+					break
+				}
+				log.Printf("Ошибка принятия соединения обнаружения: %v", err)
+				continue
 			}
-			log.Printf("Ошибка принятия соединения: %v", err)
-			continue
+			go handleDiscoveryConnection(conn, peers)
 		}
-		go handleDiscoveryConnection(conn, peers)
-	}
+	}()
 }
 
 // handleDiscoveryConnection обрабатывает входящее TCP соединение для обнаружения пиров
@@ -63,6 +100,13 @@ func handleDiscoveryConnection(conn net.Conn, peers chan<- Peer) {
 	n, err := conn.Read(buffer)
 	if err != nil {
 		log.Printf("Ошибка чтения из соединения %s: %v", remoteAddr, err)
+		GetEventBus().Publish(NetworkEvent{
+			Type: EventError,
+			Payload: NetworkError{
+				Message: fmt.Sprintf("Ошибка чтения из соединения %s", remoteAddr),
+				Err:     err,
+			},
+		})
 		return
 	}
 
@@ -89,70 +133,155 @@ func handleDiscoveryConnection(conn net.Conn, peers chan<- Peer) {
 			host, _, err := net.SplitHostPort(remoteAddr)
 			if err != nil {
 				log.Printf("Ошибка извлечения адреса из %s: %v", remoteAddr, err)
+				GetEventBus().Publish(NetworkEvent{
+					Type: EventError,
+					Payload: NetworkError{
+						Message: fmt.Sprintf("Ошибка извлечения адреса из %s", remoteAddr),
+						Err:     err,
+					},
+				})
+				return
+			}
+
+			// Проверяем, не является ли это нашим собственным подключением
+			if peerName == username {
+				log.Printf("Игнорирование собственного подключения от %s с именем %s", host, peerName)
+				return
+			}
+
+			if isLocalIP(host) {
+				log.Printf("Игнорирование локального IP адреса: %s", host)
 				return
 			}
 
 			if pubKey != nil {
 				log.Printf("Получена информация о пире: %s (%s)", peerName, host)
-				if peers != nil {
-					peers <- Peer{
-						Address:   host,
-						Name:      peerName,
-						PublicKey: pubKey,
-					}
+				newPeer := Peer{
+					Address:   host,
+					Name:      peerName,
+					PublicKey: pubKey,
 				}
+
+				// Обновляем список приоритетных адресов
+				updateLastKnownPeer(host)
+
+				if peers != nil {
+					peers <- newPeer
+				}
+
+				GetEventBus().Publish(NetworkEvent{
+					Type:    EventPeerDiscovered,
+					Payload: newPeer,
+				})
 			} else {
 				log.Printf("Ошибка парсинга публичного ключа от пира %s", peerName)
+				GetEventBus().Publish(NetworkEvent{
+					Type: EventError,
+					Payload: NetworkError{
+						Message: fmt.Sprintf("Ошибка парсинга публичного ключа от пира %s", peerName),
+						Err:     errors.New("invalid public key"),
+					},
+				})
 			}
 		}
 	}
 }
 
-// announcePeers периодически отправляет сообщения для объявления о себе
-// и поиска других пиров в сети
+// announcePeers выполняет начальное сканирование сети
 func announcePeers() {
-	log.Println("Запуск периодического оповещения о наличии пира")
+	log.Println("Запуск начального сканирования сети")
 
 	// Получаем список IP адресов для сканирования
 	ips := getLocalNetworkIPs()
 
-	ticker := time.NewTicker(discoveryPingDelay)
+	// Выполняем начальное сканирование
+	scanNetwork(ips)
+
+	// После начального сканирования только поддерживаем соединения с известными пирами
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for running {
 		<-ticker.C
-		scanNetwork(ips)
+		// Проверяем только известные пиры
+		priorityIPs := getPriorityIPs()
+		if len(priorityIPs) > 0 {
+			// Создаем контекст для быстрого сканирования известных пиров
+			ctx := context.Background()
+			scanNetworkWithContext(ctx, priorityIPs)
+		}
 	}
+}
+
+// startManualScan запускает сканирование сети по запросу пользователя
+func startManualScan() {
+	if !atomic.CompareAndSwapInt32(&isScanning, 0, 1) {
+		log.Println("Сканирование уже выполняется")
+		return
+	}
+
+	go func() {
+		defer atomic.StoreInt32(&isScanning, 0)
+		ips := getLocalNetworkIPs()
+		scanNetwork(ips)
+	}()
 }
 
 // scanNetwork сканирует сеть на наличие других пиров
 func scanNetwork(ips []string) {
 	log.Println("Сканирование сети на наличие пиров")
 
-	// Ограничиваем общее время сканирования
-	scanTimeout := 20 * time.Second
-	deadline := time.Now().Add(scanTimeout)
+	// Создаем контекст для сканирования
+	ctx := context.Background()
+	scanNetworkWithContext(ctx, ips)
+}
 
-	// Создаем канал для отмены и waitgroup для отслеживания горутин
-	done := make(chan struct{})
-	defer close(done)
+// scanNetworkWithContext сканирует сеть с поддержкой контекста для отмены
+func scanNetworkWithContext(ctx context.Context, ips []string) {
+	log.Println("Сканирование сети на наличие пиров")
 
+	GetEventBus().Publish(NetworkEvent{
+		Type:    EventScanStarted,
+		Payload: nil,
+	})
+
+	defer func() {
+		GetEventBus().Publish(NetworkEvent{
+			Type:    EventScanFinished,
+			Payload: nil,
+		})
+	}()
+
+	// Создаем waitgroup для отслеживания горутин
 	var wg sync.WaitGroup
+
+	// Защита от некорректных входных данных
+	if len(ips) == 0 {
+		log.Println("ПРЕДУПРЕЖДЕНИЕ: Пустой список IP адресов для сканирования")
+		return
+	}
+
+	// Счетчики для статистики
+	var successCount, failCount, peerCount int32
 
 	// Канал для ограничения количества одновременных соединений
 	semaphore := make(chan struct{}, 20) // максимум 20 одновременных соединений
 
-	// Отображаем прогресс, если UI выключен
-	if !uiEnabled {
-		fmt.Println("Сканирование сети. Это может занять некоторое время...")
-	}
-
 	// Сканируем параллельно
 	for _, ip := range ips {
-		// Проверяем на превышение таймаута
-		if time.Now().After(deadline) {
-			log.Println("Превышено время сканирования, останавливаем процесс")
-			break
+		// Проверяем не отменено ли сканирование
+		select {
+		case <-ctx.Done():
+			log.Println("Сканирование отменено пользователем")
+			return
+		default:
+			// Продолжаем сканирование
+		}
+
+		// Пропускаем пустые или некорректные IP
+		if ip == "" || !isValidIP(ip) {
+			log.Printf("Пропускаем некорректный IP: %s", ip)
+			continue
 		}
 
 		// Пропускаем подключение к себе
@@ -164,19 +293,29 @@ func scanNetwork(ips []string) {
 		select {
 		case semaphore <- struct{}{}:
 			// Слот доступен, продолжаем
-		case <-done:
+		case <-ctx.Done():
 			// Сканирование отменено
 			return
 		}
 
 		wg.Add(1)
 		go func(ip string) {
-			defer wg.Done()
-			defer func() { <-semaphore }() // Освобождаем слот в семафоре
+			defer func() {
+				wg.Done()
+				<-semaphore // Освобождаем слот в семафоре
+				if r := recover(); r != nil {
+					log.Printf("КРИТИЧЕСКАЯ ОШИБКА: Паника при сканировании IP %s: %v", ip, r)
+					// Запись стека вызовов для отладки
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					log.Printf("Стек вызовов: %s", buf[:n])
+					atomic.AddInt32(&failCount, 1)
+				}
+			}()
 
 			// Проверяем на отмену перед каждым новым подключением
 			select {
-			case <-done:
+			case <-ctx.Done():
 				return
 			default:
 				// Продолжаем
@@ -187,6 +326,7 @@ func scanNetwork(ips []string) {
 			conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
 			if err != nil {
 				// Не логируем - это нормально, что многие IP не ответят
+				atomic.AddInt32(&failCount, 1)
 				return
 			}
 
@@ -194,25 +334,26 @@ func scanNetwork(ips []string) {
 			conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
 
 			// Отправляем запрос обнаружения
-			_, err = conn.Write([]byte(discoveryTCPMsg))
-			if err != nil {
+			if _, err := conn.Write([]byte(discoveryTCPMsg)); err != nil {
 				conn.Close()
+				atomic.AddInt32(&failCount, 1)
 				return
 			}
 
 			// Ждем и читаем ответ
 			buffer := make([]byte, 2048)
 			n, err := conn.Read(buffer)
-			conn.Close()
-
+			conn.Close() // Закрываем соединение сразу после чтения
 			if err != nil {
+				atomic.AddInt32(&failCount, 1)
 				return
 			}
 
+			atomic.AddInt32(&successCount, 1)
 			message := string(buffer[:n])
 			log.Printf("Получен ответ от %s: %s", addr, message)
 
-			// Обрабатываем ответ от сервера как информацию о пире
+			// Обрабатываем ответ
 			if strings.HasPrefix(message, "SWAGNET_PEER|") {
 				parts := strings.Split(message, "|")
 				if len(parts) == 3 {
@@ -226,17 +367,30 @@ func scanNetwork(ips []string) {
 							Address:   ip,
 							Name:      peerName,
 							PublicKey: pubKey,
+							LastSeen:  time.Now(),
+							IsOnline:  true,
 						}
 						peersMutex.Unlock()
 
 						log.Printf("Добавлен новый пир: %s (%s)", peerName, ip)
+						atomic.AddInt32(&peerCount, 1)
+
+						// Уведомляем о новом пире
+						GetEventBus().Publish(NetworkEvent{
+							Type: EventPeerDiscovered,
+							Payload: Peer{
+								Address:   ip,
+								Name:      peerName,
+								PublicKey: pubKey,
+								LastSeen:  time.Now(),
+								IsOnline:  true,
+							},
+						})
 
 						// Уведомляем UI о новом пире
 						if uiEnabled {
-							uiUpdatePeerList()
-						} else {
-							fmt.Printf("\nНайден новый пир: %s (%s)\n", peerName, ip)
-							printPrompt()
+							// Безопасно обновляем UI через отдельную функцию
+							safeUpdateUI()
 						}
 
 						// Сохраняем пира в базу данных
@@ -249,36 +403,47 @@ func scanNetwork(ips []string) {
 		}(ip)
 	}
 
-	// Создаем таймер для ограничения времени ожидания
-	timeout := time.AfterFunc(scanTimeout, func() {
-		close(done) // Отменяем все текущие операции
-	})
-	defer timeout.Stop()
-
-	// Ожидаем завершения всех горутин или таймаута
-	done_waiting := make(chan struct{})
+	// Ждем завершения сканирования с возможностью отмены
+	done := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done_waiting)
+		close(done)
 	}()
 
-	// Ждем либо завершения всех горутин, либо таймаута
 	select {
-	case <-done_waiting:
-		log.Println("Сканирование сети завершено успешно")
-	case <-time.After(scanTimeout):
-		log.Println("Сканирование сети остановлено по таймауту")
+	case <-done:
+		log.Printf("Сканирование сети завершено успешно: проверено %d IP, успешно %d, найдено пиров %d",
+			atomic.LoadInt32(&successCount)+atomic.LoadInt32(&failCount),
+			atomic.LoadInt32(&successCount),
+			atomic.LoadInt32(&peerCount))
+	case <-ctx.Done():
+		log.Println("Сканирование сети отменено")
 	}
 
-	if !uiEnabled {
-		fmt.Println("Сканирование сети завершено")
-		printPrompt()
-	}
+	// После завершения сканирования
+	GetEventBus().Publish(NetworkEvent{
+		Type: EventScanFinished,
+		Payload: struct {
+			SuccessCount int32
+			FailCount    int32
+			PeerCount    int32
+		}{
+			SuccessCount: atomic.LoadInt32(&successCount),
+			FailCount:    atomic.LoadInt32(&failCount),
+			PeerCount:    atomic.LoadInt32(&peerCount),
+		},
+	})
+}
+
+// isValidIP проверяет валидность IP адреса
+func isValidIP(ip string) bool {
+	return net.ParseIP(ip) != nil
 }
 
 // getLocalNetworkIPs получает список IP адресов для сканирования в локальной сети
 func getLocalNetworkIPs() []string {
 	var ips []string
+	var vpnIPs []string
 
 	// Получаем все локальные интерфейсы
 	interfaces, err := net.Interfaces()
@@ -304,14 +469,31 @@ func getLocalNetworkIPs() []string {
 				continue // Пропускаем не IPv4 адреса
 			}
 
+			// Определяем тип сети
+			isVPN := isVPNInterface(iface.Name) || !isPrivateNetwork(ipnet)
+
 			// Получаем диапазон IP адресов для сканирования
 			network := generateIPRange(ipnet)
-			ips = append(ips, network...)
+
+			if isVPN {
+				vpnIPs = append(vpnIPs, network...)
+				log.Printf("Обнаружен VPN интерфейс %s с адресами: %v", iface.Name, network)
+			} else {
+				ips = append(ips, network...)
+				log.Printf("Обнаружен локальный интерфейс %s с адресами: %v", iface.Name, network)
+			}
 		}
 	}
 
-	// Если не удалось получить список IP, используем стандартный диапазон
-	if len(ips) == 0 {
+	// Если есть и VPN и локальные адреса, используем оба набора
+	if len(vpnIPs) > 0 && len(ips) > 0 {
+		log.Printf("Обнаружены как VPN (%d), так и локальные (%d) адреса", len(vpnIPs), len(ips))
+		ips = append(ips, vpnIPs...)
+	} else if len(ips) == 0 && len(vpnIPs) > 0 {
+		// Если есть только VPN адреса, используем их
+		log.Println("Обнаружены только VPN адреса, используем их для сканирования")
+		ips = vpnIPs
+	} else if len(ips) == 0 {
 		log.Println("Не удалось получить список IP адресов, используем стандартный диапазон")
 		// Сканируем адреса 192.168.1.1-192.168.1.254
 		for i := 1; i < 255; i++ {
@@ -326,45 +508,59 @@ func getLocalNetworkIPs() []string {
 func generateIPRange(ipnet *net.IPNet) []string {
 	var ips []string
 	ip := ipnet.IP.To4()
-	mask := ipnet.Mask
 
-	// Ограничиваем количество адресов для сканирования до 254
-	// (чтобы не сканировать огромные сети)
-	maxIPs := 254
+	// Сначала добавляем приоритетные адреса
+	priorityIPs := getPriorityIPs()
+	if len(priorityIPs) > 0 {
+		log.Printf("Найдено %d приоритетных адресов для сканирования", len(priorityIPs))
+		ips = append(ips, priorityIPs...)
+	}
+
+	// Создаем множество приоритетных адресов для быстрой проверки
+	prioritySet := make(map[string]bool)
+	for _, pip := range priorityIPs {
+		prioritySet[pip] = true
+	}
+
+	// Для всех сетей используем стандартный диапазон с ограничением в 254 адреса
+	maxIPs := 254 - len(priorityIPs) // Уменьшаем максимум на количество приоритетных адресов
+	if maxIPs <= 0 {
+		return ips // Возвращаем только приоритетные адреса
+	}
 
 	// Проверяем маску - если сеть слишком большая, сканируем только подсеть /24
-	ones, _ := mask.Size()
+	ones, _ := ipnet.Mask.Size()
 	if ones < 24 {
 		log.Printf("Сеть %s слишком большая, сканируем только подсеть /24", ipnet.String())
-		// Берем первые 3 октета и сканируем последний октет
 		baseIP := fmt.Sprintf("%d.%d.%d.", ip[0], ip[1], ip[2])
+
+		// Генерируем адреса от 1 до 254, исключая приоритетные
 		for i := 1; i < 255; i++ {
-			ips = append(ips, baseIP+fmt.Sprintf("%d", i))
+			newIP := baseIP + fmt.Sprintf("%d", i)
+			if !prioritySet[newIP] {
+				ips = append(ips, newIP)
+			}
 		}
 		return ips
 	}
 
 	// Для небольших сетей сканируем весь диапазон
-	// Вычисляем диапазон IP адресов
-	first := ip.Mask(mask)
+	first := ip.Mask(ipnet.Mask)
 	last := make(net.IP, len(ip))
 	copy(last, ip)
-	for i := 0; i < len(mask); i++ {
-		last[i] = ip[i] | ^mask[i]
+	for i := 0; i < len(ipnet.Mask); i++ {
+		last[i] = ip[i] | ^ipnet.Mask[i]
 	}
 
-	// Преобразуем в uint32 для удобства итерации
 	firstIP := ipToUint32(first)
 	lastIP := ipToUint32(last)
 
-	// Ограничиваем количество адресов
-	if lastIP-firstIP > uint32(maxIPs) {
-		lastIP = firstIP + uint32(maxIPs)
-	}
-
-	// Пропускаем адрес сети и broadcast
+	// Добавляем все адреса, исключая приоритетные
 	for i := firstIP + 1; i < lastIP; i++ {
-		ips = append(ips, uint32ToIP(i).String())
+		newIP := uint32ToIP(i).String()
+		if !prioritySet[newIP] {
+			ips = append(ips, newIP)
+		}
 	}
 
 	return ips
@@ -382,27 +578,285 @@ func uint32ToIP(n uint32) net.IP {
 }
 
 // isLocalIP проверяет, является ли IP адрес локальным
+// или принадлежит текущему компьютеру
 func isLocalIP(ipStr string) bool {
+	// Обрабатываем пустые строки
+	if ipStr == "" {
+		return true
+	}
+
+	// Обрезаем зону для IPv6 адресов (часть после %)
+	ipWithoutZone := ipStr
+	if idx := strings.Index(ipStr, "%"); idx != -1 {
+		ipWithoutZone = ipStr[:idx]
+		log.Printf("Обрабатываем IPv6 адрес с зоной: %s (без зоны: %s)", ipStr, ipWithoutZone)
+	}
+
+	// Проверка на валидность IP
+	ip := net.ParseIP(ipWithoutZone)
+	if ip == nil {
+		log.Printf("Невалидный IP адрес: %s", ipStr)
+		return false
+	}
+
+	// Быстрые проверки на специальные адреса
+	if ip.IsLoopback() {
+		log.Printf("IP %s - это loopback адрес", ipStr)
+		return true
+	}
+
+	if ip.IsUnspecified() {
+		log.Printf("IP %s - это неспецифицированный адрес", ipStr)
+		return true
+	}
+
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		log.Printf("IP %s - это link-local адрес", ipStr)
+		return true
+	}
+
+	// Проверка на совпадение с собственным именем пользователя
+	var nameMatch bool
+	peersMutex.RLock()
+	for _, peer := range peers {
+		if peer.Name == username && strings.HasPrefix(peer.Address, ipWithoutZone) {
+			nameMatch = true
+			break
+		}
+	}
+	peersMutex.RUnlock()
+
+	if nameMatch {
+		log.Printf("IP %s связан с текущим пользователем %s", ipStr, username)
+		return true
+	}
+
 	// Получаем все локальные адреса
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
+		log.Printf("Ошибка получения локальных интерфейсов: %v", err)
 		return false
 	}
 
-	// Преобразуем строку в IP
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	// Сравниваем с локальными адресами
+	// Сравниваем с каждым локальным адресом
 	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-			if ipnet.IP.To4().Equal(ip.To4()) {
-				return true
-			}
+		var localIP net.IP
+		var ipNet *net.IPNet
+
+		switch v := addr.(type) {
+		case *net.IPNet:
+			localIP = v.IP
+			ipNet = v
+		case *net.IPAddr:
+			localIP = v.IP
+		}
+
+		if localIP == nil {
+			continue
+		}
+
+		// Убираем зону, если она есть
+		localIPStr := localIP.String()
+		if idx := strings.Index(localIPStr, "%"); idx != -1 {
+			localIPStr = localIPStr[:idx]
+		}
+
+		// Прямое сравнение IP адресов
+		if ipWithoutZone == localIPStr {
+			log.Printf("IP %s совпадает с локальным %s", ipStr, localIPStr)
+			return true
+		}
+
+		// Сравнение через IP.Equal для учета разных форматов записи
+		if localIP.Equal(ip) {
+			log.Printf("IP %s совпадает с локальным %s (через Equal)", ipStr, localIPStr)
+			return true
+		}
+
+		// Для VPN интерфейсов проверяем только точное совпадение
+		if ipNet != nil && isVPNInterface(getInterfaceNameByIP(localIP)) {
+			continue
+		}
+
+		// Для локальных сетей проверяем принадлежность подсети
+		if ipNet != nil && ipNet.Contains(ip) && isPrivateNetwork(ipNet) {
+			log.Printf("IP %s находится в локальной подсети %s", ipStr, ipNet)
+			return true
 		}
 	}
 
 	return false
+}
+
+// getInterfaceNameByIP получает имя интерфейса по IP адресу
+func getInterfaceNameByIP(ip net.IP) string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if v.IP.Equal(ip) {
+					return iface.Name
+				}
+			case *net.IPAddr:
+				if v.IP.Equal(ip) {
+					return iface.Name
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// processPeers обрабатывает обнаруженных пиров
+func processPeers(discoveredPeers <-chan Peer) {
+	if discoveredPeers == nil {
+		log.Println("ОШИБКА: Канал обнаружения пиров не инициализирован")
+		return
+	}
+
+	log.Println("Запущен процесс обработки обнаруженных пиров")
+
+	for running {
+		// Заменяем select с одним case на прямое чтение из канала
+		peer, ok := <-discoveredPeers
+		if !ok {
+			log.Println("Канал обнаружения пиров закрыт, завершаем обработку")
+			return
+		}
+
+		// Проверяем валидность данных пира
+		if peer.Address == "" || peer.Name == "" || peer.PublicKey == nil {
+			log.Printf("ПРЕДУПРЕЖДЕНИЕ: Получены некорректные данные пира: %+v", peer)
+			continue
+		}
+
+		// Добавляем пира в список с блокировкой
+		peersMutex.Lock()
+		_, exists := peers[peer.Address]
+		peers[peer.Address] = peer
+		peersMutex.Unlock()
+
+		if exists {
+			log.Printf("Обновлен существующий пир: %s (%s)", peer.Name, peer.Address)
+		} else {
+			log.Printf("Добавлен новый пир: %s (%s)", peer.Name, peer.Address)
+		}
+
+		// Обновляем UI, если он включен
+		if uiEnabled {
+			// Проверяем активность UI перед обновлением
+			uiMutex.Lock()
+			isUIActive := uiActive
+			uiMutex.Unlock()
+
+			if isUIActive && running {
+				log.Printf("Обновляем UI после обнаружения пира %s", peer.Name)
+				safeUpdateUI()
+			} else {
+				log.Println("UI не активен, пропускаем обновление")
+			}
+		} else {
+			// Консольный режим (если UI не включен)
+			fmt.Printf("\nНайден новый пир: %s (%s)\n", peer.Name, peer.Address)
+			printPrompt()
+		}
+
+		// Сохраняем пира в базу данных
+		if dbEnabled {
+			err := savePeerInfo(peer)
+			if err != nil {
+				log.Printf("Ошибка сохранения информации о пире %s: %v", peer.Name, err)
+			}
+		}
+	}
+}
+
+// isVPNInterface определяет является ли интерфейс VPN-интерфейсом
+func isVPNInterface(ifaceName string) bool {
+	// Типичные имена VPN интерфейсов
+	vpnPatterns := []string{
+		"tun", "tap", "ppp", "vpn", "wg", "nordlynx",
+		"proton", "mullvad", "wireguard", "openvpn",
+	}
+
+	ifaceName = strings.ToLower(ifaceName)
+	for _, pattern := range vpnPatterns {
+		if strings.Contains(ifaceName, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPrivateNetwork проверяет является ли сеть частной (локальной)
+func isPrivateNetwork(ipnet *net.IPNet) bool {
+	// Определяем частные диапазоны IP адресов (RFC 1918)
+	privateRanges := []struct {
+		start net.IP
+		end   net.IP
+	}{
+		{
+			net.ParseIP("10.0.0.0"),
+			net.ParseIP("10.255.255.255"),
+		},
+		{
+			net.ParseIP("172.16.0.0"),
+			net.ParseIP("172.31.255.255"),
+		},
+		{
+			net.ParseIP("192.168.0.0"),
+			net.ParseIP("192.168.255.255"),
+		},
+	}
+
+	ip := ipnet.IP.To4()
+	if ip == nil {
+		return false
+	}
+
+	for _, r := range privateRanges {
+		if bytes.Compare(ip, r.start) >= 0 && bytes.Compare(ip, r.end) <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// updateLastKnownPeer обновляет информацию о последнем известном пире
+func updateLastKnownPeer(ip string) {
+	lastKnownPeersMutex.Lock()
+	defer lastKnownPeersMutex.Unlock()
+	lastKnownPeers[ip] = time.Now()
+	// Очищаем старые записи (старше 1 часа)
+	for ip, lastSeen := range lastKnownPeers {
+		if time.Since(lastSeen) > 1*time.Hour {
+			delete(lastKnownPeers, ip)
+		}
+	}
+}
+
+// getPriorityIPs возвращает список приоритетных IP адресов для сканирования
+func getPriorityIPs() []string {
+	lastKnownPeersMutex.RLock()
+	defer lastKnownPeersMutex.RUnlock()
+
+	priorityIPs := make([]string, 0, len(lastKnownPeers))
+	for ip, lastSeen := range lastKnownPeers {
+		// Включаем только адреса, которые были активны в последний час
+		if time.Since(lastSeen) <= 1*time.Hour {
+			priorityIPs = append(priorityIPs, ip)
+		}
+	}
+	return priorityIPs
 }
