@@ -58,58 +58,108 @@ type PeerListItem struct {
 	selected bool
 }
 
-func NewPeerListItem(peer Peer) *PeerListItem {
-	item := &PeerListItem{peer: peer}
-	item.ExtendBaseWidget(item)
-	return item
+// PeerListItemRenderer is the renderer for PeerListItem
+type PeerListItemRenderer struct {
+	item          *PeerListItem
+	statusColor   *canvas.Circle
+	nameLabel     *widget.Label
+	lastSeenLabel *widget.Label
+	unreadLabel   *widget.Label
+	objects       []fyne.CanvasObject
 }
 
-func (p *PeerListItem) CreateRenderer() fyne.WidgetRenderer {
-	// Создаем индикатор статуса (круг)
-	statusColor := &canvas.Circle{}
-	if p.peer.IsOnline {
-		statusColor.FillColor = theme.SuccessColor() // Зеленый для онлайн
+func (r *PeerListItemRenderer) Destroy() {}
+
+func (r *PeerListItemRenderer) Layout(size fyne.Size) {
+	r.statusColor.Resize(fyne.NewSize(10, 10))
+	r.statusColor.Move(fyne.NewPos(5, (size.Height-10)/2))
+
+	nameSize := r.nameLabel.MinSize()
+	r.nameLabel.Resize(nameSize)
+	r.nameLabel.Move(fyne.NewPos(20, (size.Height-nameSize.Height)/2))
+
+	unreadSize := r.unreadLabel.MinSize()
+	r.unreadLabel.Resize(unreadSize)
+	r.unreadLabel.Move(fyne.NewPos(25+nameSize.Width, (size.Height-unreadSize.Height)/2))
+
+	lastSeenSize := r.lastSeenLabel.MinSize()
+	r.lastSeenLabel.Resize(lastSeenSize)
+	r.lastSeenLabel.Move(fyne.NewPos(size.Width-lastSeenSize.Width-5, (size.Height-lastSeenSize.Height)/2))
+}
+
+func (r *PeerListItemRenderer) MinSize() fyne.Size {
+	nameSize := r.nameLabel.MinSize()
+	unreadSize := r.unreadLabel.MinSize()
+	lastSeenSize := r.lastSeenLabel.MinSize()
+
+	width := 20 + nameSize.Width + unreadSize.Width + lastSeenSize.Width + 10
+	height := fyne.Max(fyne.Max(nameSize.Height, unreadSize.Height), lastSeenSize.Height)
+
+	return fyne.NewSize(width, height+10)
+}
+
+func (r *PeerListItemRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *PeerListItemRenderer) Refresh() {
+	if r.item.peer.IsOnline {
+		r.statusColor.FillColor = theme.SuccessColor()
 	} else {
-		statusColor.FillColor = theme.DisabledColor() // Серый для оффлайн
+		r.statusColor.FillColor = theme.DisabledColor()
 	}
-	statusColor.Resize(fyne.NewSize(10, 10))
+	r.statusColor.Refresh()
 
-	// Имя пира
-	name := widget.NewLabel(p.peer.Name)
+	r.nameLabel.SetText(r.item.peer.Name)
+	r.nameLabel.Refresh()
 
-	// Время последнего онлайна
-	lastSeen := widget.NewLabel(formatLastSeen(p.peer.LastSeen))
+	r.lastSeenLabel.SetText(formatLastSeen(r.item.peer.LastSeen))
+	r.lastSeenLabel.Refresh()
 
 	// Получаем количество непрочитанных сообщений
 	unreadCount := 0
-	if messages, err := getMessagesWithPeer(p.peer.Name); err == nil {
+	if messages, err := getMessagesWithPeer(r.item.peer.Name); err == nil {
 		for _, msg := range messages {
-			if !msg.IsRead && msg.Sender == p.peer.Name {
+			if !msg.IsRead && msg.Sender == r.item.peer.Name {
 				unreadCount++
 			}
 		}
 	}
 
-	// Добавляем счетчик непрочитанных сообщений
-	var unreadLabel *widget.Label
 	if unreadCount > 0 {
-		unreadLabel = widget.NewLabel(fmt.Sprintf(" (%d)", unreadCount))
-		unreadLabel.TextStyle = fyne.TextStyle{Bold: true}
+		r.unreadLabel.SetText(fmt.Sprintf("(%d)", unreadCount))
 	} else {
-		unreadLabel = widget.NewLabel("")
+		r.unreadLabel.SetText("")
+	}
+	r.unreadLabel.Refresh()
+}
+
+func (p *PeerListItem) CreateRenderer() fyne.WidgetRenderer {
+	statusColor := canvas.NewCircle(theme.DisabledColor())
+	if p.peer.IsOnline {
+		statusColor.FillColor = theme.SuccessColor()
+	}
+	statusColor.Resize(fyne.NewSize(10, 10))
+
+	nameLabel := widget.NewLabel(p.peer.Name)
+	nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	lastSeenLabel := widget.NewLabel(formatLastSeen(p.peer.LastSeen))
+	lastSeenLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
+	unreadLabel := widget.NewLabel("")
+	unreadLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	renderer := &PeerListItemRenderer{
+		item:          p,
+		statusColor:   statusColor,
+		nameLabel:     nameLabel,
+		lastSeenLabel: lastSeenLabel,
+		unreadLabel:   unreadLabel,
+		objects:       []fyne.CanvasObject{statusColor, nameLabel, unreadLabel, lastSeenLabel},
 	}
 
-	// Контейнер с горизонтальным расположением
-	content := container.NewHBox(
-		statusColor,
-		widget.NewLabel("  "), // Отступ
-		name,
-		unreadLabel,
-		widget.NewLabel("  "), // Отступ
-		lastSeen,
-	)
-
-	return widget.NewSimpleRenderer(content)
+	return renderer
 }
 
 // formatLastSeen форматирует время последнего онлайна
@@ -311,35 +361,39 @@ func initUIComponents() {
 			return NewPeerListItem(Peer{})
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			peersMutex.Lock()
-			defer peersMutex.Unlock()
+			fyne.Do(func() {
+				peersMutex.Lock()
+				defer peersMutex.Unlock()
 
-			item := obj.(*PeerListItem)
-			i := 0
-			for _, peer := range peers {
-				if i == id {
-					item.peer = peer
-					item.Refresh()
-					break
+				item := obj.(*PeerListItem)
+				i := 0
+				for _, peer := range peers {
+					if i == id {
+						item.peer = peer
+						item.Refresh()
+						break
+					}
+					i++
 				}
-				i++
-			}
+			})
 		},
 	)
 
 	// Обработчик выбора пира
 	peerList.OnSelected = func(id widget.ListItemID) {
-		peersMutex.RLock()
-		var peerNames []string
-		for _, peer := range peers {
-			peerNames = append(peerNames, peer.Name)
-		}
-		peersMutex.RUnlock()
+		fyne.Do(func() {
+			peersMutex.RLock()
+			var peerNames []string
+			for _, peer := range peers {
+				peerNames = append(peerNames, peer.Name)
+			}
+			peersMutex.RUnlock()
 
-		if id < len(peerNames) {
-			CurrentPeer = peerNames[id]
-			loadMessagesForCurrentPeer()
-		}
+			if id < len(peerNames) {
+				CurrentPeer = peerNames[id]
+				loadMessagesForCurrentPeer()
+			}
+		})
 	}
 
 	// Список сообщений
@@ -614,7 +668,9 @@ func startPeriodicUpdates() {
 	go func() {
 		for range messageUpdateTicker.C {
 			if CurrentPeer != "" {
-				loadMessagesForCurrentPeer()
+				fyne.Do(func() {
+					loadMessagesForCurrentPeer()
+				})
 			}
 		}
 	}()
@@ -623,7 +679,9 @@ func startPeriodicUpdates() {
 	peerUpdateTicker = time.NewTicker(2 * time.Second)
 	go func() {
 		for range peerUpdateTicker.C {
-			MainWindow.Canvas().Refresh(peerList)
+			fyne.Do(func() {
+				MainWindow.Canvas().Refresh(peerList)
+			})
 		}
 	}()
 
@@ -632,7 +690,9 @@ func startPeriodicUpdates() {
 		switch event.Type {
 		case EventMessageReceived:
 			if msg, ok := event.Payload.(MessageRecord); ok {
-				addMessage(msg)
+				fyne.Do(func() {
+					addMessage(msg)
+				})
 			}
 		}
 	})
@@ -644,18 +704,24 @@ func subscribeToNetworkEvents() {
 		switch event.Type {
 		case EventPeerDiscovered:
 			// Обновляем UI
-			MainWindow.Canvas().Refresh(peerList)
+			fyne.Do(func() {
+				MainWindow.Canvas().Refresh(peerList)
+			})
 
 		case EventScanStarted:
 			// Обновляем состояние кнопки сканирования
-			scanButton.Disable()
-			scanButton.SetText("Сканирование...")
+			fyne.Do(func() {
+				scanButton.Disable()
+				scanButton.SetText("Сканирование...")
+			})
 
 		case EventScanFinished:
 			// Восстанавливаем состояние кнопки
-			scanButton.Enable()
-			scanButton.SetText("Сканировать сеть")
-			MainWindow.Canvas().Refresh(peerList)
+			fyne.Do(func() {
+				scanButton.Enable()
+				scanButton.SetText("Сканировать сеть")
+				MainWindow.Canvas().Refresh(peerList)
+			})
 		}
 	})
 }
@@ -682,9 +748,11 @@ func runUI() {
 
 // safeUpdateUI безопасно обновляет UI из любой части приложения
 func safeUpdateUI() {
-	if peerList != nil {
-		MainWindow.Canvas().Refresh(peerList)
-	}
+	fyne.Do(func() {
+		if peerList != nil {
+			MainWindow.Canvas().Refresh(peerList)
+		}
+	})
 }
 
 // getNewMessages получает новые сообщения с определенным пиром после указанного timestamp
@@ -826,4 +894,10 @@ func uiShowError(message string) {
 	fyne.Do(func() {
 		dialog.ShowError(errors.New(message), MainWindow)
 	})
+}
+
+func NewPeerListItem(peer Peer) *PeerListItem {
+	item := &PeerListItem{peer: peer}
+	item.ExtendBaseWidget(item)
+	return item
 }
